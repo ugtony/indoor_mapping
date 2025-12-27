@@ -92,6 +92,9 @@ DBG_DIR="${OUT_DIR}/debug"
 
 mkdir -p "${OUT_DIR}" "${LOG_DIR}" "${VIZ_DIR}" "${DBG_DIR}"
 
+# 備份設定檔
+[ -f "${CONFIG_FILE}" ] && cp "${CONFIG_FILE}" "${OUT_DIR}/config_used.env"
+
 if [ -x "/opt/conda/bin/python" ]; then PY="/opt/conda/bin/python"; else PY="${PY:-python3}"; fi
 
 echo "========================================"
