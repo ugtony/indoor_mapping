@@ -1,6 +1,7 @@
 # lib/localization_engine.py
 import numpy as np
 import cv2
+import time
 import torch
 import h5py
 import pycolmap
@@ -198,11 +199,24 @@ class LocalizationEngine:
                  verbose: bool = False,
                  block_filter: list = None):
         
-        # [New] 使用 Semaphore 保護整個定位流程
+        import time 
+        
+        def sync_time():
+            if 'cuda' in str(self.device):
+                torch.cuda.synchronize()
+            return time.time()
+
+        timings = {}
+        t_start_total = sync_time()
+        
         with self.semaphore:
             if fov_deg is None: fov_deg = self.default_fov
             if top_k_db is None: top_k_db = self.default_top_k
             
+            # ==========================================
+            # 1. 影像前處理 (Image Preprocessing)
+            # ==========================================
+            t0 = sync_time()
             h_orig, w_orig = image_arr.shape[:2]
             resize_max = 1024
             scale = 1.0
@@ -220,13 +234,21 @@ class LocalizationEngine:
             
             img_t = torch.from_numpy(image_tensor.transpose(2, 0, 1)).float().div(255.).unsqueeze(0).to(self.device)
             img_g = torch.from_numpy(cv2.cvtColor(image_tensor, cv2.COLOR_RGB2GRAY)).float().div(255.).unsqueeze(0).unsqueeze(0).to(self.device)
-
-            # 2. Global Feature
-            q_global = self.model_extract_global({'image': img_t})['global_descriptor']
-            q_global_cpu = q_global.cpu()   #為了與 CPU 上的 DB 比對，將 Query Global 移至 CPU
             
-            # 3. Local Feature
+            t1 = sync_time()
+            timings['1_preprocessing'] = t1 - t0
+
+            # ==========================================
+            # 2. 特徵提取與相機初始化 (Feature Extraction)
+            # ==========================================
+            t2_0 = sync_time()
+            q_global = self.model_extract_global({'image': img_t})['global_descriptor']
+            t2_1 = sync_time()
+            
             q_local = self.model_extract_local({'image': img_g})
+            t2_2 = sync_time()
+            
+            q_global_cpu = q_global.cpu()   
             kpts = q_local['keypoints'][0]
             desc = q_local['descriptors'][0]
             
@@ -253,13 +275,22 @@ class LocalizationEngine:
                 model='SIMPLE_PINHOLE', width=w_orig, height=h_orig, 
                 params=np.array([f, w_orig/2.0, h_orig/2.0], dtype=np.float64)
             )
+            
+            t2_3 = sync_time()
+            
+            # 寫入細項時間
+            timings['2a_feat_global_gpu'] = t2_1 - t2_0
+            timings['2b_feat_local_gpu'] = t2_2 - t2_1
+            timings['2c_feat_cpu_post'] = t2_3 - t2_2
+            timings['2_feature_extraction'] = t2_3 - t2_0
 
+            # ==========================================
+            # 3. 全域檢索與區塊篩選 (Global Retrieval)
+            # ==========================================
             candidate_blocks = []
             for name, block in self.blocks.items():
                 if block_filter is not None and name not in block_filter:
-                    if verbose: print(f"  [Log] Skipping block {name} (not in filter)")
                     continue
-
                 sim = torch.matmul(q_global_cpu, block['global_vecs'].t())
                 k_scoring = min(5, sim.shape[1])
                 if k_scoring > 0:
@@ -281,47 +312,53 @@ class LocalizationEngine:
                     diag[f'retrieval_top{rank}'] = "None"
                     diag[f'retrieval_score{rank}'] = 0.0
 
+            t3 = sync_time()
+            timings['3_global_retrieval'] = t3 - t2_3
+
             if not candidate_blocks:
                 diag['status'] = 'Fail_No_Retrieval'
-                return {'success': False, 'inliers': 0, 'diagnosis': diag}
+                best_result = {'success': False, 'inliers': 0, 'diagnosis': diag}
+                return self._finalize_result(best_result, timings, t_start_total, sync_time)
 
             valid_block_results = []
             best_fail_stats = diag.copy()
 
-            # 遍歷候選區塊 (Candidate Blocks) 進行精確定位
-            for _, block_name, sim_matrix in candidate_blocks:
-                if verbose:
-                    print(f"  [Log] Checking Block: {block_name}")
+            # 初始化 Matching 細項時間累積
+            time_match_h5_io = 0.0
+            time_match_transfer_gpu = 0.0
+            time_match_lightglue_gpu = 0.0
+            time_match_cpu_post = 0.0
+            time_local_matching_total = 0.0
+            time_pnp_transform = 0.0
 
+            for _, block_name, sim_matrix in candidate_blocks:
                 block = self.blocks[block_name]
                 k_val = min(top_k_db, sim_matrix.shape[1])
                 scores, indices = torch.topk(sim_matrix, k=k_val, dim=1)
                 indices = indices[0].cpu().numpy()
                 
-                # 批次讀取局部特徵 (Batch Loading) ---
-                # 先從硬碟 H5 一次性讀取所有 Top-K 影像特徵到 CPU 清單中
-                # 避免原本「讀一張、傳一次 GPU、算一次」造成的 I/O 與 Bus 等待
+                # ==========================================
+                # 4. 局部特徵匹配 (Local Feature Matching)
+                # ==========================================
+                t_match_start = sync_time()
+                
+                # (4a) H5 I/O 與 CPU 預載
+                t_h5_start = sync_time()
                 db_features_preloaded = []
                 for rank, db_idx in enumerate(indices):
                     db_name = block['global_names'][db_idx]
                     if db_name not in block['local_h5'] or db_name not in block['name_to_id']:
                         continue
-                    
                     grp = block['local_h5'][db_name]
-                    # 讀取資料到 CPU RAM (Numpy -> Tensor)
                     kpts_db = torch.from_numpy(grp['keypoints'].__array__()).float()
                     desc_db = torch.from_numpy(grp['descriptors'].__array__()).float()
-                    # 確保描述符維度正確 (N, 256)
                     if desc_db.shape[0] != 256 and desc_db.shape[1] == 256:
                         desc_db = desc_db.T
-                    
                     db_features_preloaded.append({
-                        'rank': rank,
-                        'db_name': db_name,
-                        'kpts': kpts_db,
-                        'desc': desc_db
+                        'rank': rank, 'db_name': db_name, 'kpts': kpts_db, 'desc': desc_db
                     })
-                # -----------------------------------------------
+                t_h5_end = sync_time()
+                time_match_h5_io += (t_h5_end - t_h5_start)
 
                 p2d_list, p3d_list = [], []
                 viz_details = {}
@@ -329,66 +366,64 @@ class LocalizationEngine:
                 current_db_ranks = [] 
                 unique_matches = set()
 
-                # 處理預載好的局部特徵
                 for feat in db_features_preloaded:
                     db_name = feat['db_name']
                     rank = feat['rank']
                     
-                    # 搬移到 GPU 準備進行 Matching
+                    # (4b) 移至 GPU 準備運算
+                    t_transfer_start = sync_time()
                     kpts_db = feat['kpts'].to(self.device)
                     desc_db = feat['desc'].to(self.device)
-                    
                     img_obj = block['recon'].images[block['name_to_id'][db_name]]
                     cam_db = block['recon'].cameras[img_obj.camera_id]
-
                     data = {
                         'image0': torch.empty((1,1,h_orig,w_orig), device=self.device),
                         'keypoints0': kpts.unsqueeze(0), 'descriptors0': desc.unsqueeze(0),
                         'image1': torch.empty((1,1,cam_db.height,cam_db.width), device=self.device),
                         'keypoints1': kpts_db.unsqueeze(0), 'descriptors1': desc_db.unsqueeze(0)
                     }
+                    t_transfer_end = sync_time()
+                    time_match_transfer_gpu += (t_transfer_end - t_transfer_start)
                     
-                    # 執行特徵匹配 (LightGlue)
+                    # (4c) LightGlue GPU 運算
+                    t_lg_start = sync_time()
                     matches = self.model_matcher(data)['matches0'][0]
+                    t_lg_end = sync_time()
+                    time_match_lightglue_gpu += (t_lg_end - t_lg_start)
+
+                    # (4d) GPU移至CPU、轉換、過濾重複點
+                    t_cpu_start = sync_time()
                     valid = matches > -1
                     n_2d = valid.sum().item()
                     current_block_stats['matches_2d_sum'] += n_2d
                     
-                    if verbose:
-                        print(f"    > Rank {rank} ({db_name}): 2D Matches = {n_2d}", end="")
-                    
-                    if rank < 3:
-                        current_db_ranks.append({'name': db_name, 'matches_2d': n_2d})
-
+                    if rank < 3: current_db_ranks.append({'name': db_name, 'matches_2d': n_2d})
                     if n_2d < 4: 
-                        if verbose: print(" (Skipped: <4 2D)")
+                        t_cpu_end = sync_time()
+                        time_match_cpu_post += (t_cpu_end - t_cpu_start)
                         continue
 
-                    # 找出對應的 3D 點
                     p3d_ids = np.array([p.point3D_id if p.has_point3D() else -1 for p in img_obj.points2D])
                     m_q = torch.where(valid)[0].cpu().numpy()
                     m_db = matches[valid].cpu().numpy()
                     valid_3d = m_db < len(p3d_ids)
                     m_q, m_db = m_q[valid_3d], m_db[valid_3d]
                     target_ids = p3d_ids[m_db]
-                    
                     has_3d = target_ids != -1
                     n_3d = int(has_3d.sum())
                     current_block_stats['matches_3d_sum'] += n_3d
                     
                     if n_3d < 4:
-                        if verbose: print(" (Skipped: <4 3D)")
+                        t_cpu_end = sync_time()
+                        time_match_cpu_post += (t_cpu_end - t_cpu_start)
                         continue
                     
                     m_q_valid = m_q[has_3d]
                     target_ids_valid = target_ids[has_3d]
-                    
-                    new_p2d = []
-                    new_p3d = []
+                    new_p2d, new_p3d = [], []
                     kpts_np = kpts.cpu().numpy()
                     points3D_map = block['recon'].points3D
                     
-                    # 過濾重複匹配以優化 PnP 效率
                     for q_idx, tid in zip(m_q_valid, target_ids_valid):
                         q_idx = int(q_idx)
                         tid = int(tid)
@@ -397,14 +432,10 @@ class LocalizationEngine:
                             new_p2d.append(kpts_np[q_idx])
                             new_p3d.append(points3D_map[tid].xyz)
                     
-                    if not new_p2d:
-                        if verbose: print(" (All Duplicate)")
-                        continue
+                    if new_p2d:
+                        p2d_list.append(np.array(new_p2d, dtype=np.float64))
+                        p3d_list.append(np.array(new_p3d, dtype=np.float64))
                     
-                    p2d_list.append(np.array(new_p2d, dtype=np.float64))
-                    p3d_list.append(np.array(new_p3d, dtype=np.float64))
-                    
-                    if verbose: print(f", 3D Points = {len(new_p2d)} (Unique) -> Added")
                     if rank == 0: 
                         viz_details['matched_db_name'] = db_name
                         if return_details:
@@ -414,37 +445,37 @@ class LocalizationEngine:
                                 'kpts_db': kpts_db.cpu().numpy(),
                                 'matches': matches.cpu().numpy()
                             })
+                    t_cpu_end = sync_time()
+                    time_match_cpu_post += (t_cpu_end - t_cpu_start)
 
-                # 更新診斷資訊
+                t_match_end = sync_time()
+                time_local_matching_total += (t_match_end - t_match_start)
+
                 if block_name == diag.get('retrieval_top1'):
                      best_fail_stats['num_matches_2d'] = current_block_stats['matches_2d_sum']
                      best_fail_stats['num_matches_3d'] = current_block_stats['matches_3d_sum']
                      best_fail_stats['db_ranks'] = current_db_ranks
-                     if current_block_stats['matches_3d_sum'] == 0:
-                         best_fail_stats['status'] = 'Fail_No_3D_Match'
-                     else:
-                         best_fail_stats['status'] = 'Fail_PnP_Error'
+                     if current_block_stats['matches_3d_sum'] == 0: best_fail_stats['status'] = 'Fail_No_3D_Match'
+                     else: best_fail_stats['status'] = 'Fail_PnP_Error'
 
                 if not p2d_list: continue
                 p2d_concat = np.concatenate(p2d_list, axis=0)
                 p3d_concat = np.concatenate(p3d_list, axis=0)
                 
-                if verbose:
-                    print(f"    [PnP Input] Total 2D-3D Correspondences: {len(p2d_concat)}")
-                
+                # ==========================================
+                # 5. PnP 姿態估計與優化 (PnP Pose & Transform)
+                # ==========================================
+                t_pnp_start = sync_time()
                 try:
-                    # 執行 PnP 姿態估計
                     refine_opts = pycolmap.AbsolutePoseRefinementOptions()
                     refine_opts.refine_focal_length = True
                     refine_opts.refine_extra_params = False
-
                     ret = pycolmap.estimate_and_refine_absolute_pose(
                         p2d_concat, p3d_concat, camera, 
                         estimation_options={'ransac': {'max_error': 12.0}},
                         refinement_options=refine_opts
                     )
                     success, qvec, tvec, num_inliers = False, None, None, 0
-                    
                     if ret:
                         if isinstance(ret, dict):
                             success = ret.get('success', False)
@@ -453,7 +484,6 @@ class LocalizationEngine:
                             success = ret.success
                             num_inliers = ret.num_inliers
 
-                        # 若 Refine 失敗，嘗試純 RANSAC
                         if not success:
                              ret_ransac = pycolmap.estimate_absolute_pose(
                                  p2d_concat, p3d_concat, camera, estimation_options={'ransac': {'max_error': 12.0}}
@@ -464,10 +494,7 @@ class LocalizationEngine:
                                 elif ret_ransac.num_inliers > 0: success = True
                                 if success: ret = ret_ransac 
 
-                        # 過濾低於門檻的 Inliers
-                        if success and num_inliers < 15:
-                            success = False
-                            if verbose: print(f"    [Filter] Low inliers ({num_inliers} < 15), marking as Failed.")
+                        if success and num_inliers < 15: success = False
 
                         if success:
                             if isinstance(ret, dict):
@@ -482,13 +509,7 @@ class LocalizationEngine:
                             if q_raw is not None:
                                 qvec = np.array([q_raw[3], q_raw[0], q_raw[1], q_raw[2]])
 
-                    if verbose and success:
-                        print(f"    [PnP Result] Success! Inliers: {num_inliers}")
-                    elif verbose:
-                        print(f"    [PnP Result] Failed.")
-
                     if success and qvec is not None:
-                        # 計算 SfM 與 地圖座標轉換
                         q_scipy = colmap_to_scipy_quat(qvec)
                         R_w2c = Rotation.from_quat(q_scipy).as_matrix()
                         R_c2w = R_w2c.T
@@ -513,20 +534,16 @@ class LocalizationEngine:
 
                         res_diag = diag.copy()
                         res_diag.update({
-                            'pnp_top1_block': block_name,
-                            'pnp_top1_inliers': num_inliers,
-                            'num_matches_2d': current_block_stats['matches_2d_sum'],
-                            'num_matches_3d': len(p2d_concat),
-                            'status': 'Success',
-                            'db_ranks': current_db_ranks,
+                            'pnp_top1_block': block_name, 'pnp_top1_inliers': num_inliers,
+                            'num_matches_2d': current_block_stats['matches_2d_sum'], 'num_matches_3d': len(p2d_concat),
+                            'status': 'Success', 'db_ranks': current_db_ranks,
                             'pose_qw': qvec[0], 'pose_qx': qvec[1], 'pose_qy': qvec[2], 'pose_qz': qvec[3],
                             'pose_tx': tvec[0], 'pose_ty': tvec[1], 'pose_tz': tvec[2],
                             'map_x': map_x, 'map_y': map_y, 'map_yaw': map_yaw
                         })
                         
                         res = {
-                            'success': True, 'block': block_name, 
-                            'pose': {'qvec': qvec, 'tvec': tvec}, 
+                            'success': True, 'block': block_name, 'pose': {'qvec': qvec, 'tvec': tvec}, 
                             'transform': block['transform'], 'inliers': num_inliers,
                             'matched_db_name': viz_details.get('matched_db_name', 'unknown'),
                             'diagnosis': res_diag
@@ -534,8 +551,18 @@ class LocalizationEngine:
                         if return_details: res.update(viz_details)
                         valid_block_results.append(res)
                 except Exception as e:
-                    print(f"[Error] PnP failed for {block_name}: {e}"); continue
+                    print(f"[Error] PnP failed for {block_name}: {e}")
+                
+                t_pnp_end = sync_time()
+                time_pnp_transform += (t_pnp_end - t_pnp_start)
             
+            timings['4a_match_h5_io'] = time_match_h5_io
+            timings['4b_match_transfer_gpu'] = time_match_transfer_gpu
+            timings['4c_match_lightglue_gpu'] = time_match_lightglue_gpu
+            timings['4d_match_cpu_post'] = time_match_cpu_post
+            timings['4_local_matching'] = time_local_matching_total
+            timings['5_pnp_and_transform'] = time_pnp_transform
+
             if valid_block_results:
                 valid_block_results.sort(key=lambda x: x['inliers'], reverse=True)
                 best_result = valid_block_results[0]
@@ -560,40 +587,56 @@ class LocalizationEngine:
                 for r in ['1', '2', '3']: 
                     best_result['diagnosis'][f'pnp_top{r}_inliers'] = 0
                     best_result['diagnosis'][f'pnp_top{r}_block'] = "None"
-                
-            return best_result
+            
+            return self._finalize_result(best_result, timings, t_start_total, sync_time)
+
+    # 封裝一個小函式處理結果與時間的綁定，保持主程式整潔
+    def _finalize_result(self, best_result, timings, t_start_total, sync_time):
+        timings['total_time'] = sync_time() - t_start_total
+        diag = best_result.get('diagnosis', {})
+        diag['time_preprocessing'] = timings.get('1_preprocessing', 0.0)
+        
+        # 特徵提取細項
+        diag['time_feat_ext'] = timings.get('2_feature_extraction', 0.0)
+        diag['time_feat_global_gpu'] = timings.get('2a_feat_global_gpu', 0.0)
+        diag['time_feat_local_gpu'] = timings.get('2b_feat_local_gpu', 0.0)
+        diag['time_feat_cpu'] = timings.get('2c_feat_cpu_post', 0.0)
+        
+        diag['time_global_retrieval'] = timings.get('3_global_retrieval', 0.0)
+        
+        # 匹配細項
+        diag['time_local_matching'] = timings.get('4_local_matching', 0.0)
+        diag['time_match_h5_io'] = timings.get('4a_match_h5_io', 0.0)
+        diag['time_match_transfer_gpu'] = timings.get('4b_match_transfer_gpu', 0.0)
+        diag['time_match_lg_gpu'] = timings.get('4c_match_lightglue_gpu', 0.0)
+        diag['time_match_cpu'] = timings.get('4d_match_cpu_post', 0.0)
+        
+        diag['time_pnp_transform'] = timings.get('5_pnp_and_transform', 0.0)
+        diag['time_total'] = timings.get('total_time', 0.0)
+        
+        best_result['diagnosis'] = diag
+        best_result['timings'] = timings
+        return best_result
+
 
     def format_diagnosis(self, diag_raw: dict = None) -> dict:
         if diag_raw is None: diag_raw = {}
-
         rank_owner = diag_raw.get('pnp_top1_block')
         if not rank_owner or rank_owner == 'None':
             rank_owner = diag_raw.get('retrieval_top1', 'None')
-        
         def fmt_rank_name(name):
             if not name or name == 'None': return 'None'
             return f"{rank_owner}/{name}"
-
         ranks = diag_raw.get('db_ranks', [])
         if ranks is None: ranks = []
         ranks = list(ranks)
-        while len(ranks) < 3: 
-            ranks.append({'name': 'None', 'matches_2d': 0})
+        while len(ranks) < 3: ranks.append({'name': 'None', 'matches_2d': 0})
 
         return {
             "Status": diag_raw.get('status', 'Unknown'),
             "PnP_Top1_Block": diag_raw.get('pnp_top1_block', 'None'),
             "PnP_Top1_Inliers": diag_raw.get('pnp_top1_inliers', 0),
-            "PnP_Top2_Block": diag_raw.get('pnp_top2_block', 'None'),
-            "PnP_Top2_Inliers": diag_raw.get('pnp_top2_inliers', 0),
-            "PnP_Top3_Block": diag_raw.get('pnp_top3_block', 'None'),
-            "PnP_Top3_Inliers": diag_raw.get('pnp_top3_inliers', 0),
             "Retrieval_Top1": diag_raw.get('retrieval_top1', 'None'),
-            "Retrieval_Score1": diag_raw.get('retrieval_score1', 0.0),
-            "Retrieval_Top2": diag_raw.get('retrieval_top2', 'None'),
-            "Retrieval_Score2": diag_raw.get('retrieval_score2', 0.0),
-            "Retrieval_Top3": diag_raw.get('retrieval_top3', 'None'),
-            "Retrieval_Score3": diag_raw.get('retrieval_score3', 0.0),
             "R1_Name": fmt_rank_name(ranks[0]['name']),
             "R1_Match": ranks[0]['matches_2d'],
             "R2_Name": fmt_rank_name(ranks[1]['name']),
@@ -601,16 +644,23 @@ class LocalizationEngine:
             "R3_Name": fmt_rank_name(ranks[2]['name']),
             "R3_Match": ranks[2]['matches_2d'],
             "Num_Keypoints": diag_raw.get('num_kpts', 0),
-            "Num_Matches_2D": diag_raw.get('num_matches_2d', 0),
             "Num_Matches_3D": diag_raw.get('num_matches_3d', 0),
-            "Pose_Qw": diag_raw.get('pose_qw', ""),
-            "Pose_Qx": diag_raw.get('pose_qx', ""),
-            "Pose_Qy": diag_raw.get('pose_qy', ""),
-            "Pose_Qz": diag_raw.get('pose_qz', ""),
-            "Pose_Tx": diag_raw.get('pose_tx', ""),
-            "Pose_Ty": diag_raw.get('pose_ty', ""),
-            "Pose_Tz": diag_raw.get('pose_tz', ""),
             "Map_X": diag_raw.get('map_x', ""),
             "Map_Y": diag_raw.get('map_y', ""),
-            "Map_Yaw": diag_raw.get('map_yaw', "")
+            "Map_Yaw": diag_raw.get('map_yaw', ""),
+            
+            # --- 以下是更新的詳細時間清單 ---
+            "T_Preproc": round(diag_raw.get('time_preprocessing', 0.0), 3),
+            "T_Feat_Global_GPU": round(diag_raw.get('time_feat_global_gpu', 0.0), 3),
+            "T_Feat_Local_GPU": round(diag_raw.get('time_feat_local_gpu', 0.0), 3),
+            "T_Feat_CPU": round(diag_raw.get('time_feat_cpu', 0.0), 3),
+            "T_Feat_Total": round(diag_raw.get('time_feat_ext', 0.0), 3),
+            "T_Retrieval": round(diag_raw.get('time_global_retrieval', 0.0), 3),
+            "T_Match_H5_IO": round(diag_raw.get('time_match_h5_io', 0.0), 3),
+            "T_Match_To_GPU": round(diag_raw.get('time_match_transfer_gpu', 0.0), 3),
+            "T_Match_LG_GPU": round(diag_raw.get('time_match_lg_gpu', 0.0), 3),
+            "T_Match_CPU_Post": round(diag_raw.get('time_match_cpu', 0.0), 3),
+            "T_Match_Total": round(diag_raw.get('time_local_matching', 0.0), 3),
+            "T_PnP": round(diag_raw.get('time_pnp_transform', 0.0), 3),
+            "T_Total": round(diag_raw.get('time_total', 0.0), 3)
         }
